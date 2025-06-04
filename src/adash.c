@@ -273,14 +273,22 @@ static void save_active_project( const char *id ) /* id may be NULL */
 }
 
 /* ========= 1. helper: ensure an ID is well-formed ============ */
+// Accept anything that is a valid filename
 static int valid_id( const char *s )
 {
       if ( !*s )
             return 0;
+
       for ( ; *s; ++s )
-            if ( !( isalnum( (unsigned char)*s ) || *s == '-' || *s == '_' ||
-                    *s == ' ' ) )
+      {
+            unsigned char c = (unsigned char)*s;
+
+            if ( c == '/' || c == 0 ) // disallow path separator and null byte
                   return 0;
+            if ( iscntrl( c ) ) // disallow control characters
+                  return 0;
+      }
+
       return 1;
 }
 
