@@ -120,4 +120,9 @@ Requires `gcc` and `ncurses`.
 
 ```bash
 gcc adash.c -o adash -lncurses
+
+
+## Bugs
+
+- Project total time is calculated wrong, seem to just go by checkin/out, not "finish" etc...
 ```
