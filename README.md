@@ -29,3 +29,21 @@ adash path/to/your/project-dir
 ```
 
 `adash` creates its database in that directory, as ordinary text files.
+
+## Guide
+
+The interactive prompt shows: `[i/o/f/x c/d l n p q z]`.
+
+| Key | Action                       |
+| --- | ---------------------------- |
+| `i` | Check in                     |
+| `o` | Check out                    |
+| `f` | Finish current project       |
+| `x` | Cancel current project       |
+| `c` | Add comment                  |
+| `d` | Delete comment               |
+| `l` | List all comments            |
+| `n` | Create new project           |
+| `p` | Switch to project list       |
+| `q` | Quit the application         |
+| `z` | Switch to checked-in project |

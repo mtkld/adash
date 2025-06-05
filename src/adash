@@ -100,7 +100,7 @@ prompt_loop() {
 	while :; do
 		((redraw)) && show_project
 
-		printf $'\ncmd [i/o/f/x c/d l n p q] > '
+		printf $'\ncmd [i/o/f/x c/d l n p q z] > '
 		read -rsn1 cmd
 
 		case "$cmd" in
