@@ -2,33 +2,23 @@
 SRC_DIR     := src
 INSTALL_DIR := /usr/local/bin
 BIN_NAME    := adash
-SRC_FILE    := $(SRC_DIR)/$(BIN_NAME).c
+SRC_FILE    := $(SRC_DIR)/$(BIN_NAME)  # now the bash script
 
-CFLAGS      := -Wall -Wextra -O2
-LDFLAGS     := -lncurses
+# No compilation flags needed for bash script
 
-# Default target: build the binary
-all: $(BIN_NAME)
+# Default target: "install" the script by copying it and setting executable permission
+all: install
 
-$(BIN_NAME): $(SRC_FILE)
-	@echo "Compiling $(SRC_FILE) → $(BIN_NAME)..."
-	@$(CC) $(CFLAGS) $(SRC_FILE) -o $(BIN_NAME) $(LDFLAGS)
-
-# Install target
-install: $(BIN_NAME)
+install: $(SRC_FILE)
 	@echo "Installing $(BIN_NAME) to $(INSTALL_DIR)..."
-	@install -m 755 $(BIN_NAME) $(INSTALL_DIR)/$(BIN_NAME)
+	@install -m 755 $(SRC_FILE) $(INSTALL_DIR)/$(BIN_NAME)
 
-# Uninstall target
 uninstall:
 	@echo "Removing $(INSTALL_DIR)/$(BIN_NAME)..."
 	@rm -f $(INSTALL_DIR)/$(BIN_NAME)
 
-# Clean target
 clean:
-	@echo "Removing built binary..."
-	@rm -f $(BIN_NAME)
+	@echo "Nothing to clean for bash script."
 
-# Phony targets
 .PHONY: all install uninstall clean
 

@@ -1,0 +1,591 @@
+#!/usr/bin/env bash
+
+set +H # disable ! history expansion
+
+###############################################################################
+#  statlog.sh – simple TUI project time-logger (Bash edition)
+#  two-pane version – 2025-05-31
+#
+#  Features (parity with the C version)
+#  ──────────────────────────────────────────────────────────────────────────
+#  • LIST view & DATA view, switched with ↵ / p.
+#  • Arrow or j/k navigation, highlighted row.
+#  • a / f / c / s filters (all/finished/canceled/started).
+#  • n – new project, A – archive, x – delete.
+#  • i/o/f/x – check-in / out / finish / cancel inside DATA view.
+#  • c – add comment, d – delete comment, l – list all comments.
+#  • State kept in <base>/data  <base>/state  <base>/archived
+###############################################################################
+shopt -s extglob # for pattern-matching
+
+# ────────────────────────────  Configuration  ────────────────────────────── #
+MAX_PREVIEW=64
+LOCK_FILE=checkedin
+RUN_FILE=running
+
+# Colours (tput numbers)
+CLR_MAG=$(tput setaf 5) CLR_YEL=$(tput setaf 3)
+CLR_CYA=$(tput setaf 6) CLR_RED=$(tput setaf 1)
+CLR_GRN=$(tput setaf 2) CLR_WHT=$(tput setaf 7)
+CLR_REV=$(tput rev) CLR_BLD=$(tput bold)
+CLR_RST=$(tput sgr0)
+
+# ─────────────────────────────  Globals  ─────────────────────────────────── #
+BASE="$1"
+[[ -z "$BASE" ]] && {
+	echo "Usage: $0 <base_dir>"
+	exit 1
+}
+
+DATA="$BASE/data"
+STATE="$BASE/state"
+ARCH="$BASE/archived"
+mkdir -p "$DATA" "$STATE" "$ARCH"
+
+active_id="" # current project
+mode=list    # list | data | quit
+comments=()  # loaded for DATA view
+idx=0        # cursor in comments
+filter=all   # list view filter
+row=0        # highlighted list row
+
+# ─────────────────────────────  Helpers  ─────────────────────────────────── #
+
+error_msg() {
+
+	printf "\n${CLR_RED}Error:${CLR_RST} %s\n" "$1"
+}
+get_project_state() {
+	local f="$DATA/$active_id.log"
+	[[ -f $f ]] || {
+		echo "none"
+		return
+	}
+	tac "$f" | awk -F'\t' '$2 != "comment" { print $2; exit }'
+}
+show_project() {
+	statbar
+	local state
+	state=$(get_project_state)
+	local state_color
+	case "$state" in
+	checkin) state_color=$CLR_MAG ;;
+	checkout) state_color=$CLR_YEL ;;
+	created) state_color=$CLR_CYA ;;
+	finish) state_color=$CLR_GRN ;;
+	cancel) state_color=$CLR_RED ;;
+	*) state_color=$CLR_WHT ;;
+	esac
+
+	printf '\n%sProject:%s %s  %s[%s]%s\n' \
+		"${CLR_BLD}${CLR_GRN}" "${CLR_RST}" "$active_id" \
+		"${CLR_BLD}${state_color}" "$state" "${CLR_RST}"
+
+	local tot h m
+	tot=$(total_minutes)
+	h=$((tot / 60))
+	m=$((tot % 60))
+	printf 'Total time : %dh %02dm\n' "$h" "$m"
+
+	if ((${#comments[@]})); then
+		IFS='|' read -r ts msg <<<"${comments[-1]}"
+		printf 'Latest comment (%s): %s\n' "$ts" "$msg"
+	else
+		printf 'No comments yet\n'
+	fi
+}
+
+prompt_loop() {
+	local cmd redraw=1
+	while :; do
+		((redraw)) && show_project
+
+		printf $'\ncmd [i/o/f/x c/d l n p q] > '
+		read -rsn1 cmd
+
+		case "$cmd" in
+		"") redraw=0 ;; # Enter only
+
+		i)
+			if write_log checkin; then
+				redraw=1
+			else
+				redraw=0
+			fi
+			;;
+
+		o)
+			if write_log checkout; then
+				redraw=1
+			else
+				redraw=0
+			fi
+			;;
+
+		f)
+			if write_log finish; then
+				redraw=1
+			else
+				redraw=0
+			fi
+			;;
+
+		x)
+			if write_log cancel; then
+				redraw=1
+			else
+				redraw=0
+			fi
+			;;
+
+		X)
+			# Delete project, its id file
+			read -r locked <"$STATE/$LOCK_FILE" 2>/dev/null
+			if [[ "$locked" != "$active_id" ]]; then
+				error_msg "Must be checked in to delete this project."
+				sleep 0.5
+				redraw=0
+			else
+				echo
+				read -rp "Really delete project '$active_id'? [y/N] " confirm
+				if [[ $confirm =~ ^[Yy]$ ]]; then
+					rm -f "$DATA/$active_id.log"
+					: >|"$STATE/$LOCK_FILE"
+					: >|"$STATE/$RUN_FILE"
+					rm -f "$STATE/index.cache"
+					active_id=""
+					comments=()
+					idx=0
+					printf "${CLR_RED}Project deleted.${CLR_RST}\n"
+					sleep 0.5
+					mode=list
+					return
+				else
+					printf "Cancelled.\n"
+					sleep 0.5
+					redraw=1
+				fi
+			fi
+			;;
+		c)
+			if edit_comment; then
+				redraw=1
+			else
+				redraw=0
+			fi
+			;;
+
+		d)
+			if delete_comment; then
+				redraw=1
+			else
+				redraw=0
+			fi
+			;;
+
+		l)
+			list_all_comments
+			redraw=1
+			;;
+		n)
+			read -rp "New project ID: " new_id
+			if [[ $new_id =~ ^[A-Za-z0-9._-]+$ ]]; then
+				if [[ -f "$DATA/$new_id.log" ]]; then
+					error_msg "Project already exists."
+				else
+					echo "$(iso_now)"$'\tcreated\t' >>"$DATA/$new_id.log"
+					active_id="$new_id"
+					save_active "$new_id"
+					load_comments
+					printf "${CLR_GRN}Created and switched to '$new_id'${CLR_RST}\n"
+				fi
+			else
+				error_msg "Invalid ID (a-z, A-Z, 0-9, ., _, -)"
+			fi
+			redraw=1
+			;;
+		z)
+			read -r locked <"$STATE/$LOCK_FILE" 2>/dev/null
+			if [[ -z $locked ]]; then
+				error_msg "No project is currently checked in."
+				sleep 0.5
+				redraw=0
+			else
+				active_id="$locked"
+				save_active "$active_id"
+				load_comments
+				redraw=1
+			fi
+			;;
+		p)
+			mode=list
+			return
+			;;
+		q)
+			mode=quit
+			return
+			;;
+		*)
+			error_msg "Unknown command"
+			sleep 0.25
+			redraw=0
+			;;
+		esac
+
+		load_comments
+	done
+}
+
+rebuild_cache_if_needed() {
+	local cache="$STATE/index.cache"
+	local latest_log=$(find "$DATA" -type f -name '*.log' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n1 | cut -d' ' -f2)
+	local latest_cache=$(find "$cache" -type f -printf '%T@ %p\n' 2>/dev/null | cut -d' ' -f1)
+
+	# Rebuild if cache is missing or older than newest log
+	if [[ ! -f $cache || "$latest_log" && "$latest_log" -nt $cache ]]; then
+		>"$cache"
+		for f in "$DATA"/*.log; do
+			[[ -e $f ]] || continue
+			id=${f##*/}
+			id=${id%.log}
+			valid_id "$id" || continue
+			ts="0000"
+			state="created"
+			preview=""
+			while IFS=$'\t' read -r t a rest; do
+				case $a in
+				comment) [[ -z $preview ]] && preview="${rest:0:$MAX_PREVIEW}" ;;
+				checkin | checkout | created | finish | cancel)
+					ts=$t
+					state=$a
+					;;
+				esac
+			done <"$f"
+			printf "%s|%s|%s|%s\n" "$id" "$ts" "$state" "$preview" >>"$cache"
+		done
+	fi
+}
+iso_now() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+parse_iso() { date -d "$1" +%s 2>/dev/null; } # → epoch or empty
+
+statbar() { # top status line
+	read -r locked <"$STATE/$LOCK_FILE" 2>/dev/null || locked=""
+	printf "\r${CLR_BLD}"
+	if [[ $locked ]]; then
+		printf "Checked-in to ${CLR_GRN}●${CLR_BLD} %s" "$locked"
+	else
+		printf "No project currently checked-in"
+	fi
+	printf "%*s${CLR_RST}\n" $((COLUMNS - ${#locked} - 27)) ""
+}
+
+valid_id() { [[ $1 == +([!-./[:cntrl:]]) ]]; }
+
+# ─────────────────────────────  State  ───────────────────────────────────── #
+load_active() { read -r active_id <"$STATE/$RUN_FILE" 2>/dev/null || active_id=""; }
+save_active() { printf "%s\n" "$1" >|"$STATE/$RUN_FILE"; }
+
+load_comments() { # fills comments[]  (DATA view)
+	comments=()
+	idx=0
+	[[ ! $active_id ]] && return
+	local file="$DATA/$active_id.log"
+	[[ -f $file ]] || return
+	while IFS=$'\t' read -r ts act msg; do
+		[[ $act == comment ]] && comments+=("$ts|$msg")
+	done <"$file"
+	((${#comments[@]})) && idx=$((${#comments[@]} - 1))
+}
+
+# ────────────────────────────  Logging  ──────────────────────────────────── #
+write_log() { # $1 action  [$2 comment]
+	[[ -z $active_id ]] && return 1
+	local file="$DATA/$active_id.log"
+	local ts
+	ts=$(iso_now)
+	local locked
+	read -r locked <"$STATE/$LOCK_FILE" 2>/dev/null
+
+	case $1 in
+	checkin)
+		if [[ $locked == "$active_id" ]]; then
+			error_msg "Already checked in to this project."
+			return 1
+		elif [[ -n $locked ]]; then
+			error_msg "Already checked in to '$locked'. Check out first."
+			return 1
+		fi
+		printf "%s\tcheckin\t\n" "$ts" >>"$file"
+		printf "%s\n" "$active_id" >|"$STATE/$LOCK_FILE"
+		rm -f "$STATE/index.cache" # <-- Clear cache here
+		;;
+
+	checkout | finish | cancel)
+		printf "%s\t%s\t\n" "$ts" "$1" >>"$file"
+		: >|"$STATE/$LOCK_FILE"
+		rm -f "$STATE/index.cache" # <-- Clear cache here
+		;;
+
+	comment)
+		if [[ $locked != "$active_id" ]]; then
+			error_msg "Check in first."
+			sleep 0.25
+			return 1
+		fi
+		printf "%s\tcomment\t%s\n" "$ts" "$2" >>"$file"
+		;;
+
+	created)
+		printf "%s\tcreated\t\n" "$ts" >>"$file"
+		rm -f "$STATE/index.cache" # <-- Clear cache here (optional)
+		;;
+	*)
+		return 1
+		;;
+	esac
+
+	return 0
+}
+
+total_minutes() { # summed checkins for project
+	local f="$DATA/$active_id.log" cin=0 total=0
+	[[ -f $f ]] || {
+		echo 0
+		return
+	}
+	while IFS=$'\t' read -r ts act _; do
+		case $act in
+		checkin) cin=$(parse_iso "$ts") ;;
+		checkout)
+			[[ $cin ]] && ((total += ($(parse_iso "$ts") - cin) / 60))
+			cin=0
+			;;
+		esac
+	done <"$f"
+	echo $total
+}
+
+# ────────────────────────────  LIST view  ───────────────────────────────── #
+collect_projects() {
+	local cache="$STATE/index.cache"
+	rebuild_cache_if_needed
+	cat "$cache" | sort -t'|' -k2,2r
+}
+
+filter_match() { # $1 state
+	case $filter in
+	all) return 0 ;;
+	finished) [[ $1 == finish ]] ;;
+	canceled) [[ $1 == cancel ]] ;;
+	started) [[ $1 == created ]] ;;
+	esac
+}
+
+draw_list() {
+	local -a list=()
+	mapfile -t list < <(collect_projects)
+	local visible=()
+	for i in "${!list[@]}"; do
+		IFS='|' read -r id ts st pv <<<"${list[i]}"
+		filter_match "$st" && visible+=("$i") || true
+	done
+	((${#visible[@]} == 0)) && row=0 || ((row >= ${#visible[@]})) && row=$((${#visible[@]} - 1))
+
+	clear
+	statbar
+	printf "${CLR_BLD}Project list – %s (%d shown)${CLR_RST}\n" "$filter" "${#visible[@]}"
+	printf "[↑↓/jk] nav  ↵ open  n new  a/f/c/s filter  A archive  x delete  q quit\n\n"
+	for k in "${!visible[@]}"; do
+		IFS='|' read -r id ts st pv <<<"${list[${visible[k]}]}"
+		sym="●" col=$CLR_WHT
+		case $st in
+		checkin) sym="●" col=$CLR_MAG ;;
+		checkout) sym="●" col=$CLR_YEL ;;
+		created) sym="●" col=$CLR_CYA ;;
+		cancel) sym="✘" col=$CLR_RED ;;
+		finish) sym="✔" col=$CLR_GRN ;;
+		esac
+		((k == row)) && printf "${CLR_REV}"
+		printf "%b %-12s %s %-19s %-.*s%b\n" "$col" "$sym" "$id" "$ts" $((COLUMNS - 40)) "$pv" "${CLR_RST}"
+	done
+	((${#visible[@]})) || printf "(no projects match filter)\n"
+	# Return indices array via global var VIS
+	VIS=("${visible[@]}")
+	LIST=("${list[@]}")
+}
+
+create_project() {
+	[[ -s "$STATE/$LOCK_FILE" ]] && {
+		error_msg "Check-out first"
+		return
+	}
+	printf "New project id: "
+	read -r id
+	valid_id "$id" || {
+		error_msg "Invalid id"
+		return
+	}
+	active_id="$id"
+	save_active "$id"
+	write_log created
+	load_comments
+	mode=data
+}
+
+archive_or_delete() { # $1=archive|delete
+	[[ ${#VIS[@]} -eq 0 ]] && return
+	IFS='|' read -r id _ <<<"${LIST[${VIS[row]}]}"
+	[[ $id == "$(<"$STATE/$LOCK_FILE" 2>/dev/null)" ]] && : >|"$STATE/$LOCK_FILE"
+	[[ $id == "$(<"$STATE/$RUN_FILE" 2>/dev/null)" ]] && save_active ""
+	case $1 in
+	archive)
+		mv "$DATA/$id.log" "$ARCH/$id.log"
+		;;
+	delete)
+		rm -f "$DATA/$id.log"
+		;;
+	esac
+}
+
+# Because 	printf "x%-${width}.${width}s" "$str" wouldnt work
+fit_width() {
+	local str="$1"
+	local width="$2"
+	local out="${str:0:$width}"
+	local len="${#out}"
+	while [ "$len" -lt "$width" ]; do
+		out="$out "
+		len=$((len + 1))
+	done
+	printf '%s' "$out"
+}
+fit_width() {
+	local str="$1"
+	local width="$2"
+	local out="${str:0:$width}"
+	while [ "${#out}" -lt "$width" ]; do
+		out+=" "
+	done
+	printf '%s' "$out"
+}
+
+SEP=$'\x1e'
+
+list_loop() {
+	rebuild_cache_if_needed
+
+	selected=$(
+		while IFS='|' read -r id ts state preview; do
+			id_fmt=$(fit_width "$id" 46)
+			state_fmt=$(fit_width "$state" 10)
+			ts_fmt=$(fit_width "$ts" 20)
+			preview_clean=${preview//$'\t'/ }
+			preview_fmt=$(fit_width "$preview_clean" 40)
+
+			# color state after padding
+			case $state in
+			checkin) state_col="${CLR_MAG}${state_fmt}${CLR_RST}" ;;
+			checkout) state_col="${CLR_YEL}${state_fmt}${CLR_RST}" ;;
+			created) state_col="${CLR_CYA}${state_fmt}${CLR_RST}" ;;
+			finish) state_col="${CLR_GRN}${state_fmt}${CLR_RST}" ;;
+			cancel) state_col="${CLR_RED}${state_fmt}${CLR_RST}" ;;
+			*) state_col="${CLR_WHT}${state_fmt}${CLR_RST}" ;;
+			esac
+
+			# Compose display with state first, then ID, then timestamp (and preview if needed)
+			#visual="${state_col}  ${id_fmt}  ${ts_fmt}  ${preview_fmt}"
+			visual="${state_col}  ${id_fmt}  ${ts_fmt}"
+
+			# Print hidden ID (field 1) and visible line (field 2)
+			printf '%s%s%s\n' "$id" "$SEP" "$visual"
+		done <"$STATE/index.cache" |
+			fzf --ansi --delimiter="$SEP" \
+				--with-nth=2 \
+				--nth=1 \
+				--prompt='Project > ' \
+				--no-sort --tiebreak=index \
+				--preview-window=down:1 \
+				--height=90% --reverse --exact --algo=v2
+	) || return
+
+	active_id=${selected%%"$SEP"*}
+	[[ $active_id ]] || return
+
+	save_active "$active_id"
+	load_comments
+	mode=data
+}
+
+# ────────────────────────────  DATA view  ───────────────────────────────── #
+
+edit_comment() {
+	local locked
+	read -r locked <"$STATE/$LOCK_FILE" 2>/dev/null
+
+	if [[ "$locked" != "$active_id" ]]; then
+		error_msg "Check-in first."
+		sleep 0.25
+		return 1
+	fi
+
+	printf "Comment: "
+	IFS= read -r msg
+
+	if [[ -n "${msg//[[:space:]]/}" ]]; then
+		if write_log comment "$msg"; then
+			load_comments
+			return 0
+		else
+			return 1
+		fi
+	else
+		printf "${CLR_RED}Aborted${CLR_RST}\n"
+		sleep 0.5
+		return 1
+	fi
+}
+delete_comment() {
+	((${#comments[@]})) || return 1
+
+	IFS='|' read -r ts msg <<<"${comments[idx]}"
+	local src="$DATA/$active_id.log"
+	local tmp="$DATA/$active_id.tmp"
+
+	if grep -vF "$ts"$'\tcomment\t'"$msg" "$src" >"$tmp"; then
+		mv "$tmp" "$src"
+		load_comments
+		return 0
+	else
+		rm -f "$tmp"
+		error_msg "Failed to delete comment."
+		return 1
+	fi
+}
+
+list_all_comments() {
+	clear
+	printf "${CLR_BLD}All comments – %s${CLR_RST}\n" "$active_id"
+	printf "q to return\n\n"
+	for c in "${comments[@]}"; do
+		IFS='|' read -r ts m <<<"$c"
+		printf "• %s  —  %s\n" "$ts" "$m"
+	done
+	while IFS= read -rsn1 k; do [[ $k == q ]] && break; done
+}
+
+# ──────────────────────────────  Main  ──────────────────────────────────── #
+load_active
+[[ $active_id ]] && mode=data
+
+stty sane # ← restore cooked input mode
+
+trap 'clear' EXIT
+while [[ $mode != quit ]]; do
+	case $mode in
+	list) list_loop ;;
+	data) prompt_loop ;;
+	esac
+done
+
+clear
+echo "bye."
