@@ -188,8 +188,9 @@ prompt_loop() {
 			redraw=1
 			;;
 		n)
+			echo
 			read -rp "New project ID: " new_id
-			if [[ $new_id =~ ^[A-Za-z0-9._-]+$ ]]; then
+			if [[ $new_id =~ ^[A-Za-z0-9._\ -]+$ ]]; then
 				if [[ -f "$DATA/$new_id.log" ]]; then
 					error_msg "Project already exists."
 				else
@@ -279,7 +280,10 @@ statbar() { # top status line
 	printf "%*s${CLR_RST}\n" $((COLUMNS - ${#locked} - 27)) ""
 }
 
-valid_id() { [[ $1 == +([!-./[:cntrl:]]) ]]; }
+#valid_id() { [[ $1 == +([!-./[:cntrl:]]) ]]; }
+valid_id() {
+	[[ $1 =~ ^[A-Za-z0-9._\ -]+$ ]]
+}
 
 # ─────────────────────────────  State  ───────────────────────────────────── #
 load_active() { read -r active_id <"$STATE/$RUN_FILE" 2>/dev/null || active_id=""; }
@@ -478,19 +482,41 @@ list_loop() {
 		while IFS='|' read -r id ts state preview; do
 			id_fmt=$(fit_width "$id" 46)
 			state_fmt=$(fit_width "$state" 10)
-			ts_fmt=$(fit_width "$ts" 20)
+			ts_clean=${ts%%T*} # strip everything from T onwards
+			ts_fmt=$(fit_width "$ts_clean" 20)
+
 			preview_clean=${preview//$'\t'/ }
 			preview_fmt=$(fit_width "$preview_clean" 40)
 
 			# color state after padding
+			# symbol and color mapping
 			case $state in
-			checkin) state_col="${CLR_MAG}${state_fmt}${CLR_RST}" ;;
-			checkout) state_col="${CLR_YEL}${state_fmt}${CLR_RST}" ;;
-			created) state_col="${CLR_CYA}${state_fmt}${CLR_RST}" ;;
-			finish) state_col="${CLR_GRN}${state_fmt}${CLR_RST}" ;;
-			cancel) state_col="${CLR_RED}${state_fmt}${CLR_RST}" ;;
-			*) state_col="${CLR_WHT}${state_fmt}${CLR_RST}" ;;
+			checkin)
+				sym="+"
+				col="$CLR_MAG"
+				;;
+			checkout)
+				sym="-"
+				col="$CLR_YEL"
+				;;
+			created)
+				sym="•"
+				col="$CLR_CYA"
+				;;
+			finish)
+				sym="v"
+				col="$CLR_GRN"
+				;;
+			cancel)
+				sym="x"
+				col="$CLR_RED"
+				;;
+			*)
+				sym="?"
+				col="$CLR_WHT"
+				;;
 			esac
+			state_col="${col}${sym}${CLR_RST}"
 
 			# Compose display with state first, then ID, then timestamp (and preview if needed)
 			#visual="${state_col}  ${id_fmt}  ${ts_fmt}  ${preview_fmt}"
@@ -528,6 +554,7 @@ edit_comment() {
 		return 1
 	fi
 
+	echo
 	printf "Comment: "
 	IFS= read -r msg
 
