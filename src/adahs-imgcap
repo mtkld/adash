@@ -1,0 +1,54 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# ─── ARGUMENTS ────────────────────────────────────────────────────────────
+adash_dir="$1"
+img_dir="$2"
+
+[[ -z "$adash_dir" || ! -d "$adash_dir" ]] && {
+	echo "Error: missing valid adash dir"
+	exit 1
+}
+[[ -z "$img_dir" || ! -d "$img_dir" ]] && {
+	echo "Error: missing valid image output dir"
+	exit 1
+}
+
+checkedin_file="$adash_dir/state/checkedin"
+data_dir="$adash_dir/data"
+
+# ─── CHECK IF CHECKED IN ─────────────────────────────────────────────────
+if [[ ! -s "$checkedin_file" ]]; then
+	beep || echo -ne '\a'
+	echo "Error: No active check-in."
+	exit 1
+fi
+
+project=$(<"$checkedin_file")
+log_file="$data_dir/$project.log"
+
+# ─── SCREENSHOT AND CONVERT ──────────────────────────────────────────────
+tmp_png=$(mktemp --suffix=.png)
+tmp_jpg="${tmp_png%.png}.jpg"
+
+coords=$(slop -f "-g %g") || exit 1
+maim $coords "$tmp_png"
+magick "$tmp_png" "$tmp_jpg"
+jpegoptim --strip-all --max=90 "$tmp_jpg" >/dev/null
+
+# ─── FIND NEXT FREE NAME IN IMAGE DIR ────────────────────────────────────
+i=1
+while [[ -e "$img_dir/$i.jpg" ]]; do
+	((i++))
+done
+
+final_jpg="$img_dir/$i.jpg"
+mv "$tmp_jpg" "$final_jpg"
+rm -f "$tmp_png"
+
+# ─── LOG TO PROJECT LOG FILE ─────────────────────────────────────────────
+timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+echo -e "${timestamp}\tcomment\t%$i.jpg" >>"$log_file"
+
+echolog -t "info" -m "Saved: $final_jpg and logged to $log_file"

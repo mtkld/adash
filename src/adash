@@ -100,7 +100,7 @@ prompt_loop() {
 	while :; do
 		((redraw)) && show_project
 
-		printf $'\ncmd [i/o/f/x c/d l n p q z] > '
+		printf $'\ncmd [i/o/f/x c/d e l n p q z] > '
 		read -rsn1 cmd
 
 		case "$cmd" in
@@ -122,6 +122,16 @@ prompt_loop() {
 			fi
 			;;
 
+		e)
+			if [[ -n $active_id && -f "$DATA/$active_id.log" ]]; then
+				nvim "$DATA/$active_id.log"
+				redraw=1
+			else
+				error_msg "No active project or log file missing."
+				sleep 0.5
+				redraw=0
+			fi
+			;;
 		f)
 			if write_log finish; then
 				redraw=1
@@ -190,7 +200,9 @@ prompt_loop() {
 		n)
 			echo
 			read -rp "New project ID: " new_id
-			if [[ $new_id =~ ^[A-Za-z0-9._\ -]+$ ]]; then
+			if [[ -z $new_id || "$new_id" == *"/"* ]]; then
+				error_msg "Invalid ID: cannot be empty or contain slashes."
+			else
 				if [[ -f "$DATA/$new_id.log" ]]; then
 					error_msg "Project already exists."
 				else
@@ -200,11 +212,10 @@ prompt_loop() {
 					load_comments
 					printf "${CLR_GRN}Created and switched to '$new_id'${CLR_RST}\n"
 				fi
-			else
-				error_msg "Invalid ID (a-z, A-Z, 0-9, ., _, -)"
 			fi
 			redraw=1
 			;;
+
 		z)
 			read -r locked <"$STATE/$LOCK_FILE" 2>/dev/null
 			if [[ -z $locked ]]; then
@@ -423,6 +434,7 @@ create_project() {
 		error_msg "Check-out first"
 		return
 	}
+	echo
 	printf "New project id: "
 	read -r id
 	valid_id "$id" || {
@@ -545,32 +557,39 @@ list_loop() {
 # ────────────────────────────  DATA view  ───────────────────────────────── #
 
 edit_comment() {
-	local locked
-	read -r locked <"$STATE/$LOCK_FILE" 2>/dev/null
+	local tmpfile comment ts
+	tmpfile=$(mktemp --suffix=.comment)
 
-	if [[ "$locked" != "$active_id" ]]; then
-		error_msg "Check-in first."
-		sleep 0.25
+	# Open editor
+	nvim "$tmpfile"
+
+	# Read comment while preserving UTF-8 and newlines
+	comment=""
+	while IFS= read -r line; do
+		[[ $line =~ ^#.*$ || -z $line ]] && continue
+		comment+="$line"$'\n'
+	done <"$tmpfile"
+	comment=${comment%$'\n'} # Remove trailing newline
+
+	# Clean up editor file
+	shred -u -n 5 "$tmpfile"
+
+	# If empty after trimming
+	[[ -z "$comment" ]] && return 1
+
+	# Validate UTF-8
+	if ! printf "%s" "$comment" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
+		error_msg "Comment contains invalid UTF-8 characters!"
+		sleep 1
 		return 1
 	fi
 
-	echo
-	printf "Comment: "
-	IFS= read -r msg
-
-	if [[ -n "${msg//[[:space:]]/}" ]]; then
-		if write_log comment "$msg"; then
-			load_comments
-			return 0
-		else
-			return 1
-		fi
-	else
-		printf "${CLR_RED}Aborted${CLR_RST}\n"
-		sleep 0.5
-		return 1
-	fi
+	# Write to log
+	ts=$(iso_now)
+	printf "%s\tcomment\t%s\n" "$ts" "$comment" >>"$DATA/$active_id.log"
+	return 0
 }
+
 delete_comment() {
 	((${#comments[@]})) || return 1
 
