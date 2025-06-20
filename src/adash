@@ -1,7 +1,91 @@
 #!/usr/bin/env bash
 
+#!/usr/bin/env bash
+set +H # disable ! history expansion
+set -euo pipefail
+
+###############################################################################
+# quick dispatcher – run these tiny helpers and exit early
+###############################################################################
+
+#!/usr/bin/env bash
 set +H # disable ! history expansion
 
+case "$1" in
+--get-todo-list)
+	shift
+	proj="$1"
+	[[ -z "${proj:-}" || ! -f "$proj" ]] && exit 1
+	SEP=$'\x1e' # delimiter for field separation
+	while IFS=$'\t' read -r ts act msg cid; do
+		[[ $act == comment && $msg == td\ \[* ]] || continue
+		printf '%s%s%s%s%s\n' "$ts" "$SEP" "$msg" "$SEP" "$cid"
+	done <"$proj"
+	exit 0
+	;;
+
+--toggle-todo)
+	shift
+	proj="$1"
+	cid="$2"
+	[[ -z "${proj:-}" || -z "${cid:-}" || ! -f "$proj" ]] && exit 1
+	tmp="$(mktemp)"
+	while IFS=$'\t' read -r ts act msg id; do
+		if [[ $act == comment && $id == "$cid" && $msg == td\ * ]]; then
+			if [[ "$msg" == *"[x]"* ]]; then
+				msg="${msg/\[x\]/[ ]}"
+			else
+				msg="${msg/\[ \]/[x]}"
+			fi
+		fi
+		printf '%s\t%s\t%s\t%s\n' "$ts" "$act" "$msg" "$id"
+	done <"$proj" >"$tmp"
+	mv "$tmp" "$proj"
+	exit 0
+	;;
+esac
+
+###############################################################################
+# quick dispatcher – run these tiny helpers and exit early
+###############################################################################
+case "$1" in
+--get-todo-list)
+	shift # $1 = project
+	proj="$1"
+	[[ -z $proj ]] && exit 1
+	BASE="$(dirname "$0")"
+	DATA="$BASE/data"
+	# prints:  <ts><SEP><msg><SEP><cid>
+	SEP=$'\x1e'
+	while IFS=$'\t' read -r ts act msg cid; do
+		[[ $act == comment && $msg == td\ \[* ]] || continue
+		printf '%s%s%s%s%s\n' "$ts" "$SEP" "$msg" "$SEP" "$cid"
+	done <"$DATA/$proj.log"
+	exit 0
+	;;
+--toggle-todo)
+	shift
+	proj="$1"
+	cid="$2"
+	[[ -z $proj || -z $cid ]] && exit 1
+	BASE="$(dirname "$0")"
+	DATA="$BASE/data"
+	tmp="$(mktemp)"
+	while IFS=$'\t' read -r ts act msg id; do
+		if [[ $act == comment && $id == "$cid" && $msg == td\ * ]]; then
+			[[ $msg =~ \[x\] ]] &&
+				msg="${msg/\[x\]/[ ]}" ||
+				msg="${msg/\[ \]/[x]}"
+		fi
+		printf '%s\t%s\t%s\t%s\n' "$ts" "$act" "$msg" "$id"
+	done <"$DATA/$proj.log" >"$tmp"
+	mv "$tmp" "$DATA/$proj.log"
+	exit 0
+	;;
+esac
+####################################################
+# (end of early dispatch block)
+########################################################################
 ###############################################################################
 #  statlog.sh – simple TUI project time-logger (Bash edition)
 #  two-pane version – 2025-05-31
@@ -18,6 +102,10 @@ set +H # disable ! history expansion
 ###############################################################################
 shopt -s extglob # for pattern-matching
 
+# If the very first argument began with "--" we already handled it above.
+# Throw it away so $1 now holds the real <base_dir> (if any).
+[[ $1 == --* ]] && shift
+
 # ────────────────────────────  Configuration  ────────────────────────────── #
 MAX_PREVIEW=64
 LOCK_FILE=checkedin
@@ -31,11 +119,11 @@ CLR_REV=$(tput rev) CLR_BLD=$(tput bold)
 CLR_RST=$(tput sgr0)
 
 # ─────────────────────────────  Globals  ─────────────────────────────────── #
-BASE="$1"
-[[ -z "$BASE" ]] && {
-	echo "Usage: $0 <base_dir>"
-	exit 1
-}
+if [[ -n $1 && $1 != --* ]]; then # normal run
+	BASE="$1"
+else                             # called via --toggle-todo / --list-todos-for-fzf
+	BASE="${BASE:-$(dirname "$0")}" # already set in the stub-block, but keep a fallback
+fi
 
 DATA="$BASE/data"
 STATE="$BASE/state"
@@ -51,6 +139,152 @@ row=0        # highlighted list row
 
 # ─────────────────────────────  Helpers  ─────────────────────────────────── #
 
+print_help() {
+	cat <<EOF
+DATA view keybindings:
+  i    Check in
+  o    Check out
+  f    Mark as finished
+  x    Cancel
+  X    Delete project (must be checked in)
+  c    Add comment
+  d    Delete current comment
+  e    Edit project log in nvim
+  l    List all comments
+  L    List all "cc"-prefixed comments from all projects
+  n    Create new project
+  z    Re-open last checked-in project
+  p    Return to project list view
+  q    Quit
+  ?    Show this help
+
+LIST view:
+  • Interactive selection using fzf
+  • Navigate with ↑ ↓ or j k
+  • Press ↵ (Enter) to open a project
+EOF
+}
+
+toggle_todo_by_id() {
+	local cid="$1" log="$DATA/$active_id.log" tmp
+	tmp=$(mktemp)
+	while IFS=$'\t' read -r ts act msg id; do
+		if [[ $act == comment && $id == "$cid" && $msg == td\ * ]]; then
+			if [[ $msg == td\ \[*\] ]]; then
+				msg="${msg/\[ \]/[x]}"
+			elif [[ $msg == td[xX]* ]]; then
+				msg="${msg/\[x\]/[ ]}"
+			fi
+		fi
+		printf '%s\t%s\t%s\t%s\n' "$ts" "$act" "$msg" "$id"
+	done <"$log" >"$tmp"
+	mv "$tmp" "$log"
+}
+list_todos() {
+	clear
+	printf "${CLR_BLD}TODOs – %s${CLR_RST}\n" "$active_id"
+	printf "Press q to return\n\n"
+
+	local found=0
+	while IFS=$'\t' read -r ts act msg; do
+		[[ $act == comment ]] || continue
+		[[ $msg == td* ]] || continue
+
+		local status="[ ]"
+		if [[ $msg =~ ^td[[:space:]]*\[[xX]\] ]]; then
+			status="[x]"
+		fi
+
+		printf "• %s  %s\n" "$status" "${msg#td}"
+		found=1
+	done <"$DATA/$active_id.log"
+
+	((found == 0)) && echo "(no TODOs found)"
+
+	while IFS= read -rsn1 k; do [[ $k == q ]] && break; done
+}
+toggle_todo_by_id() {
+	local cid="$1"
+	local log="$DATA/$active_id.log"
+	local tmp="$(mktemp)"
+
+	# Loop and replace the line matching this comment ID
+	while IFS=$'\t' read -r ts act msg id; do
+		if [[ "$act" == "comment" && "$id" == "$cid" ]]; then
+			if [[ "$msg" =~ ^td[[:space:]]*\[[[:space:]]\] ]]; then
+				msg="${msg/\[ \]/[x]}"
+			elif [[ "$msg" =~ ^td[[:space:]]*\[[xX]\] ]]; then
+				msg="${msg/\[x\]/[ ]}"
+			fi
+			printf "%s\tcomment\t%s\t%s\n" "$ts" "$msg" "$id" >>"$tmp"
+		else
+			printf "%s\t%s\t%s\t%s\n" "$ts" "$act" "$msg" "$id" >>"$tmp"
+		fi
+	done <"$log"
+
+	mv "$tmp" "$log"
+}
+
+list_todos_fzf() {
+	local -a lines
+	mapfile -t lines < <(get_todo_list "$active_id")
+
+	((${#lines[@]} == 0)) && {
+		error_msg "No TODOs found."
+		sleep 1
+		return
+	}
+
+	local selected
+	selected=$(
+		printf '%s\n' "${lines[@]}" |
+			fzf --ansi --delimiter="$SEP" \
+				--with-nth=1,2 \
+				--prompt='TODOs > ' \
+				--header='td TODOs — press Ctrl-X to toggle done' \
+				--bind "ctrl-x:execute-silent('$0' --toggle-todo \"$DATA/$active_id.log\" {3})+reload('$0' --get-todo-list \"$DATA/$active_id.log\")"
+	) || return
+
+	local cid="${selected##*$SEP}"
+	printf '%s' "$cid" | xsel --clipboard
+	printf "${CLR_GRN}Copied ID to clipboard: %s${CLR_RST}\n" "$cid"
+	sleep 0.8
+}
+
+search_comment_ids() {
+	local sep=$'\x1f'
+	local lines=()
+
+	while IFS= read -r -d '' file; do
+		local project
+		project=$(basename "$file" .log)
+		while IFS=$'\t' read -r ts act msg cid; do
+			[[ $act == comment && $cid =~ ^[a-f0-9]{4}$ ]] || continue
+			date_only=${ts%%T*}
+			lines+=("${cid}${sep}${project} | ${date_only} | ${msg}")
+		done <"$file"
+	done < <(find "$DATA" -name '*.log' -print0)
+
+	((${#lines[@]} == 0)) && {
+		error_msg "No ID-tagged comments found."
+		sleep 1
+		return
+	}
+
+	local selected
+	selected=$(printf "%s\n" "${lines[@]}" | fzf --ansi --delimiter="$sep" --with-nth=2 --prompt="Search comments > " --height=95% --reverse) || return
+
+	local cid="${selected%%"$sep"*}"
+	printf "#%s" "$cid" | xsel --clipboard
+	printf "${CLR_GRN}Copied ID to clipboard: ${cid}${CLR_RST}\n"
+	sleep 0.8
+}
+short_id() {
+	echo "$RANDOM$RANDOM" | sha1sum | cut -c1-4
+}
+get_locked_project() {
+	[[ -f "$STATE/$LOCK_FILE" ]] && cat "$STATE/$LOCK_FILE" || echo ""
+}
 error_msg() {
 
 	printf "\n${CLR_RED}Error:${CLR_RST} %s\n" "$1"
@@ -100,7 +334,8 @@ prompt_loop() {
 	while :; do
 		((redraw)) && show_project
 
-		printf $'\ncmd [i/o/f/x c/d e l n p q z] > '
+		printf $'\ncmd [i o f x | c d e l L s | n z p q ?] > '
+
 		read -rsn1 cmd
 
 		case "$cmd" in
@@ -114,6 +349,10 @@ prompt_loop() {
 			fi
 			;;
 
+		s)
+			search_comment_ids
+			redraw=1
+			;;
 		o)
 			if write_log checkout; then
 				redraw=1
@@ -138,6 +377,11 @@ prompt_loop() {
 			else
 				redraw=0
 			fi
+			;;
+		t)
+			#list_todos
+			list_todos_fzf
+			redraw=1
 			;;
 
 		x)
@@ -185,6 +429,13 @@ prompt_loop() {
 			fi
 			;;
 
+		\?)
+			clear
+			print_help
+			printf "\nPress any key to continue..."
+			read -rsn1
+			redraw=1
+			;;
 		d)
 			if delete_comment; then
 				redraw=1
@@ -195,6 +446,11 @@ prompt_loop() {
 
 		l)
 			list_all_comments
+			redraw=1
+			;;
+
+		L)
+			list_all_comments_all_files
 			redraw=1
 			;;
 		n)
@@ -211,11 +467,12 @@ prompt_loop() {
 					save_active "$new_id"
 					load_comments
 					printf "${CLR_GRN}Created and switched to '$new_id'${CLR_RST}\n"
+
+					rm -f "$STATE/index.cache" # 👈 Ensure fresh rebuild
 				fi
 			fi
 			redraw=1
 			;;
-
 		z)
 			read -r locked <"$STATE/$LOCK_FILE" 2>/dev/null
 			if [[ -z $locked ]]; then
@@ -280,10 +537,12 @@ rebuild_cache_if_needed() {
 iso_now() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 parse_iso() { date -d "$1" +%s 2>/dev/null; } # → epoch or empty
 
-statbar() { # top status line
-	read -r locked <"$STATE/$LOCK_FILE" 2>/dev/null || locked=""
+statbar() {
+	local locked
+	locked=$(get_locked_project)
+
 	printf "\r${CLR_BLD}"
-	if [[ $locked ]]; then
+	if [[ -n $locked ]]; then
 		printf "Checked-in to ${CLR_GRN}●${CLR_BLD} %s" "$locked"
 	else
 		printf "No project currently checked-in"
@@ -293,7 +552,7 @@ statbar() { # top status line
 
 #valid_id() { [[ $1 == +([!-./[:cntrl:]]) ]]; }
 valid_id() {
-	[[ $1 =~ ^[A-Za-z0-9._\ -]+$ ]]
+	return 0 # Because we read file from filesystem, it is a valid project ID as filenames are project IDs
 }
 
 # ─────────────────────────────  State  ───────────────────────────────────── #
@@ -319,17 +578,18 @@ write_log() { # $1 action  [$2 comment]
 	local ts
 	ts=$(iso_now)
 	local locked
-	read -r locked <"$STATE/$LOCK_FILE" 2>/dev/null
+	locked=$(get_locked_project)
 
 	case $1 in
 	checkin)
-		if [[ $locked == "$active_id" ]]; then
+		if [[ "$locked" == "$active_id" ]]; then
 			error_msg "Already checked in to this project."
 			return 1
-		elif [[ -n $locked ]]; then
+		elif [[ -n "$locked" ]]; then
 			error_msg "Already checked in to '$locked'. Check out first."
 			return 1
 		fi
+
 		printf "%s\tcheckin\t\n" "$ts" >>"$file"
 		printf "%s\n" "$active_id" >|"$STATE/$LOCK_FILE"
 		rm -f "$STATE/index.cache" # <-- Clear cache here
@@ -437,6 +697,8 @@ create_project() {
 	echo
 	printf "New project id: "
 	read -r id
+	id="${id#"${id%%[![:space:]]*}"}" # strip leading
+	id="${id%"${id##*[![:space:]]}"}" # strip trailing
 	valid_id "$id" || {
 		error_msg "Invalid id"
 		return
@@ -486,7 +748,19 @@ fit_width() {
 }
 
 SEP=$'\x1e'
+# print a raw todo list for <project>  (no UI, just machine-parsable)
+# output format:   <ts><SEP><msg><SEP><cid>
+get_todo_list() {
+	local proj="$1"
+	local log="$DATA/$proj.log"
+	[[ -f $log ]] || return # nothing to show
 
+	# only lines that begin with  "td ["  (space after td!)
+	while IFS=$'\t' read -r ts act msg cid; do
+		[[ $act == comment && $msg == td\ \[* ]] || continue
+		printf '%s%s%s%s%s\n' "$ts" "$SEP" "$msg" "$SEP" "$cid"
+	done <"$log"
+}
 list_loop() {
 	rebuild_cache_if_needed
 
@@ -586,7 +860,8 @@ edit_comment() {
 
 	# Write to log
 	ts=$(iso_now)
-	printf "%s\tcomment\t%s\n" "$ts" "$comment" >>"$DATA/$active_id.log"
+	cid=$(short_id)
+	printf "%s\tcomment\t%s\t%s\n" "$ts" "$comment" "$cid" >>"$DATA/$active_id.log"
 	return 0
 }
 
@@ -607,6 +882,21 @@ delete_comment() {
 		return 1
 	fi
 }
+list_all_comments_all_files() {
+	clear
+	printf "${CLR_BLD}All cc-comments from all projects${CLR_RST}\n"
+	printf "q to return\n\n"
+	for f in "$DATA"/*.log; do
+		[[ -f $f ]] || continue
+		id=$(basename "$f" .log)
+		while IFS=$'\t' read -r ts act msg; do
+			[[ $act == comment ]] || continue
+			[[ $msg == cc* ]] || continue
+			printf "[%s] \033[36m%s\033[0m: %s\n" "$ts" "$id" "$msg"
+		done <"$f"
+	done
+	while IFS= read -rsn1 k; do [[ $k == q ]] && break; done
+}
 
 list_all_comments() {
 	clear
@@ -619,7 +909,7 @@ list_all_comments() {
 	while IFS= read -rsn1 k; do [[ $k == q ]] && break; done
 }
 
-# ──────────────────────────────  Main  ──────────────────────────────────── #
+########################################################################
 load_active
 [[ $active_id ]] && mode=data
 
