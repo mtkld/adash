@@ -2,14 +2,13 @@
 
 #!/usr/bin/env bash
 set +H # disable ! history expansion
-set -euo pipefail
+set -uo pipefail
 
 ###############################################################################
 # quick dispatcher – run these tiny helpers and exit early
 ###############################################################################
 
 #!/usr/bin/env bash
-set +H # disable ! history expansion
 
 case "$1" in
 --get-todo-list)
@@ -26,23 +25,32 @@ case "$1" in
 
 --toggle-todo)
 	shift
-	proj="$1"
+	proj="$1" # full path to *.log
 	cid="$2"
-	[[ -z "${proj:-}" || -z "${cid:-}" || ! -f "$proj" ]] && exit 1
-	tmp="$(mktemp)"
+	[[ -z $proj || -z $cid || ! -f $proj ]] && exit 1
+
+	tmp=$(mktemp)
+	today=$(date -u +%Y-%m-%d)
+
 	while IFS=$'\t' read -r ts act msg id; do
 		if [[ $act == comment && $id == "$cid" && $msg == td\ * ]]; then
-			if [[ "$msg" == *"[x]"* ]]; then
-				msg="${msg/\[x\]/[ ]}"
-			else
-				msg="${msg/\[ \]/[x]}"
+			if [[ $msg == *"[x]"* ]]; then # currently DONE → mark UN-done
+				msg=${msg/\[x\]/[ ]}          # 1. uncheck
+				msg=${msg//\[completed:*/}    # 2. drop [completed:…]
+				msg=$(sed 's/[[:space:]]*$//' <<<"$msg")
+			else                              # currently OPEN → mark done
+				msg=${msg/\[ \]/[x]}             # 1. check
+				[[ $msg != *"[completed:"* ]] && # 2. append tag once
+					msg+=" [completed:$today]"
 			fi
 		fi
 		printf '%s\t%s\t%s\t%s\n' "$ts" "$act" "$msg" "$id"
 	done <"$proj" >"$tmp"
+
 	mv "$tmp" "$proj"
 	exit 0
 	;;
+
 esac
 
 ###############################################################################
@@ -142,26 +150,34 @@ row=0        # highlighted list row
 print_help() {
 	cat <<EOF
 DATA view keybindings:
-  i    Check in
-  o    Check out
-  f    Mark as finished
-  x    Cancel
+  i    Check in to project
+  o    Check out from project
+  f    Mark project as finished
+  x    Cancel current project
   X    Delete project (must be checked in)
-  c    Add comment
+  c    Add a comment
   d    Delete current comment
   e    Edit project log in nvim
-  l    List all comments
-  L    List all "cc"-prefixed comments from all projects
+  l    List all comments in current project
+  L    List and toggle TODOs via FZF
+  t    Add a TODO to the current (checked-in) project
+  T    Add a TODO to another project
+  s    Search for a comment by ID (copies ID to clipboard)
+  C    Show all "cc"-prefixed comments from all projects
   n    Create new project
-  z    Re-open last checked-in project
-  p    Return to project list view
+  z    Reopen last checked-in project
+  p    Return to project list
   q    Quit
   ?    Show this help
 
 LIST view:
-  • Interactive selection using fzf
   • Navigate with ↑ ↓ or j k
-  • Press ↵ (Enter) to open a project
+  • Press ↵ (Enter) to open selected project
+  • Press a / f / c / s to filter by: all, finished, canceled, started
+  • Press n to create a new project
+  • Press A to archive project
+  • Press x to delete project
+  • Press q to quit
 EOF
 }
 
@@ -240,14 +256,17 @@ list_todos_fzf() {
 		printf '%s\n' "${lines[@]}" |
 			fzf --ansi --delimiter="$SEP" \
 				--with-nth=1,2 \
+				--margin=2,2,15%,15% --height=60% \
 				--prompt='TODOs > ' \
 				--header='td TODOs — press Ctrl-X to toggle done' \
+				--preview='echo {2}' \
+				--preview-window=right:60%:wrap \
 				--bind "ctrl-x:execute-silent('$0' --toggle-todo \"$DATA/$active_id.log\" {3})+reload('$0' --get-todo-list \"$DATA/$active_id.log\")"
 	) || return
 
 	local cid="${selected##*$SEP}"
-	printf '%s' "$cid" | xsel --clipboard
-	printf "${CLR_GRN}Copied ID to clipboard: %s${CLR_RST}\n" "$cid"
+	#printf '%s' "$cid" | xsel --clipboard
+	#printf "${CLR_GRN}Copied ID to clipboard: %s${CLR_RST}\n" "$cid"
 	sleep 0.8
 }
 
@@ -378,10 +397,77 @@ prompt_loop() {
 				redraw=0
 			fi
 			;;
-		t)
+		L)
 			#list_todos
 			list_todos_fzf
 			redraw=1
+			;;
+
+		t)
+			if [[ -z $active_id ]]; then
+				error_msg "No project is currently checked in."
+				sleep 0.5
+				redraw=0
+			else
+				tmpfile=$(mktemp)
+				nvim "$tmpfile"
+				comment=$(<"$tmpfile")
+				rm -f "$tmpfile"
+
+				if [[ -n $comment ]]; then
+					ts=$(iso_now)
+					cid=$(short_id) # 4-char id like the rest
+					printf "%s\tcomment\ttd [ ] %s\t%s\n" \
+						"$ts" "$comment" "$cid" >>"$DATA/$active_id.log"
+
+					save_active "$active_id" # keep “last used” pointer
+					load_comments
+					redraw=1
+				else
+					error_msg "Empty TODO, cancelled."
+					sleep 0.5
+					redraw=0
+				fi
+			fi
+			;;
+
+		T)
+			# 1. Get the TODO text
+			tmpfile=$(mktemp)
+			nvim "$tmpfile"
+			comment=$(<"$tmpfile")
+			rm -f "$tmpfile"
+
+			if [[ -z $comment ]]; then # nothing typed
+				error_msg "Empty TODO, cancelled."
+				sleep 0.5
+				redraw=0
+				continue # ← was break
+			fi
+
+			# 2. Pick the destination project
+			target=$(find "$DATA" -name '*.log' |
+				sed 's|.*/||; s|\.log$||' |
+				fzf) || { # Esc/abort in fzf
+				redraw=0
+				continue
+			}
+			target=${target//$'\n'/} # strip newline
+
+			if [[ -n $target && -f "$DATA/$target.log" ]]; then
+				ts=$(iso_now)
+				cid=$(short_id)
+				printf "%s\tcomment\ttd [ ] %s\t%s\n" \
+					"$ts" "$comment" "$cid" >>"$DATA/$target.log"
+
+				printf "${CLR_GRN}TODO added to '%s'.${CLR_RST}\n" "$target"
+				sleep 0.5
+				redraw=1
+			else
+				error_msg "No project selected."
+				sleep 0.5
+				redraw=0
+			fi
 			;;
 
 		x)
@@ -394,7 +480,13 @@ prompt_loop() {
 
 		X)
 			# Delete project, its id file
-			read -r locked <"$STATE/$LOCK_FILE" 2>/dev/null
+			locked=""
+			if [[ -f $STATE/$LOCK_FILE ]]; then
+				# read returns 1 on empty file ⇒ add `|| true`
+				read -r locked <"$STATE/$LOCK_FILE" || true
+			fi
+			# Need the above code if the lockfile is empty, for then read exits with 1
+			#read -r locked <"$STATE/$LOCK_FILE" 2>/dev/null
 			if [[ "$locked" != "$active_id" ]]; then
 				error_msg "Must be checked in to delete this project."
 				sleep 0.5
@@ -449,7 +541,7 @@ prompt_loop() {
 			redraw=1
 			;;
 
-		L)
+		C)
 			list_all_comments_all_files
 			redraw=1
 			;;
@@ -474,7 +566,12 @@ prompt_loop() {
 			redraw=1
 			;;
 		z)
-			read -r locked <"$STATE/$LOCK_FILE" 2>/dev/null
+			locked=""
+			if [[ -f $STATE/$LOCK_FILE ]]; then
+				# read returns 1 on empty file ⇒ add `|| true`
+				read -r locked <"$STATE/$LOCK_FILE" || true
+			fi
+
 			if [[ -z $locked ]]; then
 				error_msg "No project is currently checked in."
 				sleep 0.5

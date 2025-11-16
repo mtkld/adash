@@ -3,8 +3,8 @@
 set -euo pipefail
 
 # ─── ARGUMENTS ────────────────────────────────────────────────────────────
-adash_dir="$1"
-img_dir="$2"
+adash_dir="${1:-}"
+img_dir="${2:-}"
 
 [[ -z "$adash_dir" || ! -d "$adash_dir" ]] && {
 	echo "Error: missing valid adash dir"
